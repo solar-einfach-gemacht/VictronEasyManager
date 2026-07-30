@@ -8,7 +8,7 @@ sudo mkdir -p /opt/pvmanager
 
 # 2. Programm herunterladen (Achtung: Link anpassen, wenn du die Datei bei Releases hochlädst!)
 echo "Lade PVManager herunter..."
-sudo wget -O /opt/pvmanager/PVManager https://github.com/DEIN_NAME/DEIN_REPO/releases/latest/download/PVManager-Raspberry
+sudo wget -O /opt/pvmanager/PVManager https://github.com/solar-einfach-gemacht/VictronEasyManager/releases/latest/download/PVManager-Raspberry
 
 # 3. Datei ausführbar machen
 sudo chmod +x /opt/pvmanager/PVManager
