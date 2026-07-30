@@ -34,7 +34,7 @@ Es ist sehr empfehlenswert, erst die **Windows `.exe`** herunterzuladen. Starte 
 2. Führe die Datei aus. Es öffnet sich ein schwarzes Konsolenfenster (das ist das "Gehirn", das im Hintergrund läuft).
 3. Öffne deinen Webbrowser und tippe ein:
    * Wenn du am **Windows-PC** testest: `http://localhost:5000`
-   * Wenn das Tool auf einem **Raspberry Pi** läuft: `http://victroneasymanager.local` *(falls das Netzwerk den Namen nicht auflöst, nutze einfach die IP-Adresse des Pi).*
+   * Wenn das Tool auf einem **Raspberry Pi** läuft: `http://namedeinesraspberrypi.local`
 4. Klicke im Dashboard auf **⚙️ System Einstellungen** und trage die IP-Adresse deines Victron Cerbo GX ein. Fertig!
 
 ---
