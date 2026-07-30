@@ -6,7 +6,7 @@ echo "========================================="
 # 1. Ordner erstellen
 sudo mkdir -p /opt/pvmanager
 
-# 2. Programm herunterladen (Achtung: Link anpassen, wenn du die Datei bei Releases hochlädst!)
+# 2. Programm herunterladen
 echo "Lade PVManager herunter..."
 sudo wget -O /opt/pvmanager/PVManager https://github.com/solar-einfach-gemacht/VictronEasyManager/releases/latest/download/PVManager-Raspberry
 
@@ -35,8 +35,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable pvmanager
 sudo systemctl start pvmanager
 
-echo "========================================="
-echo " INTSALLATION ERFOLGREICH ABGESCHLOSSEN!"
-echo " Du erreichst das Dashboard ab sofort unter:"
-echo " http://<IP-DEINES-RASPBERRY-PI>"
-echo "========================================="
+echo "========================================================="
+echo " 🎉 INSTALLATION ERFOLGREICH ABGESCHLOSSEN!"
+echo " Du erreichst das Dashboard ab sofort in deinem Browser:"
+echo " ➡️ http://raspberrypi.local"
+echo "    (oder unter der IP-Adresse deines Raspberry Pi)"
+echo "========================================================="
