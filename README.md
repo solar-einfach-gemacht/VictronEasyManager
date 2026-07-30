@@ -39,3 +39,29 @@ Es ist sehr empfehlenswert, erst die **Windows `.exe`** herunterzuladen. Starte 
 Öffne dein Terminal (SSH) auf dem Raspberry Pi und füge diesen einen Befehl ein. Er lädt das Programm herunter und richtet den Autostart automatisch ein:
 ```bash
 curl -sSL [https://raw.githubusercontent.com/solar-einfach-gemacht/VictronEasyManager/main/install.sh](https://raw.githubusercontent.com/solar-einfach-gemacht/VictronEasyManager/main/install.sh) | bash
+Danach öffnest du deinen Webbrowser und tippst ein: http://namedeinesraspberrypi.local (oder die IP-Adresse deines Raspberry Pi).
+
+Für beide Systeme gilt: Klicke im Dashboard auf ⚙️ System Einstellungen und trage die IP-Adresse deines Victron Cerbo GX ein. Fertig!
+🧠 Die Logik (So arbeitet der Manager)
+
+Der PVManager nimmt dir das komplizierte Mitdenken ab. Er reagiert nicht panisch auf jede Sekunde Schatten, sondern analysiert dein System intelligent.
+1. Der Wolkenschutz (Hysterese)
+
+Du kannst für jedes Gerät eine Zeitverzögerung einstellen. Geht z.B. kurz der Wasserkocher an und dein Stromzähler rutscht in den Netzbezug, schaltet das Skript deine Heizstäbe nicht sofort panisch aus. Es startet ein unsichtbarer Timer. Nur wenn der Netzbezug z.B. 5 Minuten lang anhält, wird abgeschaltet (Relais-Schutz!).
+2. Smarte Kaskadensteuerung (Für 3-Phasen-Heizstäbe)
+
+Du kannst bis zu 3 Relais zu einer Kaskade bündeln.
+
+    Bei Netz-Anlagen: Das Skript misst den Überschuss. Ist genug Strom für Stufe 1 da, geht sie an. Der Netz-Überschuss sinkt logischerweise. Steigt die Sonne weiter und es entsteht erneut Überschuss, kommt Stufe 2 dazu. Fällt die Sonne weg, schalten sich die Stufen mit einem festen 2-Minuten-Timer nacheinander wieder sauber ab.
+
+    Bei Insel-Anlagen: Steuer deine Kaskade rein nach dem Batteriestand (z.B. Stufe 1 ab 90%, Stufe 2 ab 95%).
+
+3. Wallbox & stufenlose Heizstäbe (Prioritäten-Weiche)
+
+Diese Geräte beherrschen eine geniale Logik: "Batteriestand + PV-Überschuss".
+Das bedeutet: Dein Haus-Akku wird z.B. bis 95% geladen. Sobald die 95% erreicht sind, friert das Skript die Batterieladung quasi ein und leitet den gesamten restlichen PV-Strom vom Dach exakt und stufenlos in dein Auto oder deinen Heizstab um.
+🤝 Mithelfen
+
+Da dies ein Community-Projekt ist: Ladet euch den Code herunter, bastelt daran herum, meldet Fehler (Issues) oder reicht Verbesserungen ein. Besonderes Augenmerk liegt aktuell auf dem Testen der Wallbox- und my-PV-Schnittstellen!
+
+Lizenz: MIT License - Nutzung auf eigene Gefahr.
