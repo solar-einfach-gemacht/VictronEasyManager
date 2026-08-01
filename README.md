@@ -39,4 +39,4 @@ Es ist sehr empfehlenswert, erst die **Windows `.exe`** herunterzuladen. Starte 
 Öffne dein Terminal (SSH) auf dem Raspberry Pi und füge diesen einen Befehl ein. Er lädt das Programm herunter und richtet den Autostart automatisch ein:
 
 ```bash
-curl -sSL [https://raw.githubusercontent.com/solar-einfach-gemacht/VictronEasyManager/main/install.sh](https://raw.githubusercontent.com/solar-einfach-gemacht/VictronEasyManager/main/install.sh) | bash
+curl -sSL https://raw.githubusercontent.com/solar-einfach-gemacht/VictronEasyManager/main/install.sh | bash
