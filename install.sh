@@ -1,4 +1,6 @@
 #!/bin/bash
+set -e 
+
 echo "========================================="
 echo " Start der PVManager Installation..."
 echo "========================================="
@@ -6,9 +8,9 @@ echo "========================================="
 # 1. Ordner erstellen
 sudo mkdir -p /opt/pvmanager
 
-# 2. Programm herunterladen
+# 2. Programm herunterladen (holt jetzt VictronEasyManager und speichert es als PVManager)
 echo "Lade PVManager herunter..."
-sudo wget -O /opt/pvmanager/PVManager https://github.com/solar-einfach-gemacht/VictronEasyManager/releases/latest/download/PVManager-Raspberry
+sudo wget -O /opt/pvmanager/PVManager https://github.com/solar-einfach-gemacht/VictronEasyManager/releases/latest/download/VictronEasyManager
 
 # 3. Datei ausführbar machen
 sudo chmod +x /opt/pvmanager/PVManager
