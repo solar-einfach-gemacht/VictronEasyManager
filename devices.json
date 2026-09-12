@@ -1,0 +1,24 @@
+[
+  {
+    "Id": "4b4fed63-c463-44b4-94ff-d457109a22a2",
+    "Priority": 1,
+    "Name": "gh",
+    "IpAddress": "123",
+    "SystemType": "wallbox",
+    "DeviceModel": "goe",
+    "ControlMode": "grid",
+    "OnValue": 95,
+    "OffValue": 90,
+    "OnDelayMinutes": 5,
+    "OffDelayMinutes": 10,
+    "CustomOnUrl": "",
+    "CustomOffUrl": "",
+    "ManualOverride": "auto",
+    "IsOn": false,
+    "IpAddress2": "",
+    "IpAddress3": "",
+    "OnValue2": 0,
+    "OnValue3": 0,
+    "CurrentCascadeStep": 0
+  }
+]
