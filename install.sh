@@ -1,23 +1,25 @@
 #!/bin/bash
-set -e 
+set -e
 
 echo "========================================="
 echo " Start der PVManager Installation..."
 echo "========================================="
 
-# 1. Ordner erstellen
+ARCH=$(uname -m)
+echo "Erkannte Architektur: $ARCH (das Release muss dazu passen: aarch64 = linux-arm64, armv7l = linux-arm)"
+
 sudo mkdir -p /opt/pvmanager
 
-# 2. Programm herunterladen (holt jetzt VictronEasyManager und speichert es als PVManager)
+# Bei einem Update zuerst stoppen, sonst "Text file busy"
+sudo systemctl stop pvmanager 2>/dev/null || true
+
 echo "Lade PVManager herunter..."
-sudo wget -O /opt/pvmanager/PVManager https://github.com/solar-einfach-gemacht/VictronEasyManager/releases/latest/download/VictronEasyManager
+sudo wget -O /opt/pvmanager/PVManager.new https://github.com/solar-einfach-gemacht/VictronEasyManager/releases/latest/download/VictronEasyManager
+sudo chmod +x /opt/pvmanager/PVManager.new
+sudo mv /opt/pvmanager/PVManager.new /opt/pvmanager/PVManager
 
-# 3. Datei ausführbar machen
-sudo chmod +x /opt/pvmanager/PVManager
-
-# 4. Autostart einrichten (Systemd Service)
 echo "Richte Autostart ein..."
-cat <<EOF | sudo tee /etc/systemd/system/pvmanager.service
+cat <<EOF | sudo tee /etc/systemd/system/pvmanager.service > /dev/null
 [Unit]
 Description=PVManager Hintergrund-Dienst
 After=network.target
@@ -26,16 +28,16 @@ After=network.target
 ExecStart=/opt/pvmanager/PVManager
 WorkingDirectory=/opt/pvmanager
 Restart=always
+RestartSec=5
 User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# 5. Service aktivieren und starten
 sudo systemctl daemon-reload
 sudo systemctl enable pvmanager
-sudo systemctl start pvmanager
+sudo systemctl restart pvmanager
 
 echo "========================================================="
 echo " 🎉 INSTALLATION ERFOLGREICH ABGESCHLOSSEN!"
