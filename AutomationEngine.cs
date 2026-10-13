@@ -1,32 +1,68 @@
 using System;
 using System.Collections.Generic;
-using System.Threading.Tasks;
-using System.Net.Http;
-using System.Net.Sockets; 
-using System.Net;         
-using System.Text;        
-using FluentModbus; 
 using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
+using FluentModbus;
 
 namespace VictronEasyManager
 {
     public class AutomationEngine
     {
+        // ---- Konfiguration ----
+        private const double WattPerAmpere = 690.0;   // 3-phasig (3 x 230 V). Bei 1-phasigem Laden: 230.0
+        private const int MaxAmpere = 16;
+        private const int MaxHeaterWatt = 3000;
+        private const double SocHysteresis = 2.0;      // Kaskade (SOC-Modus): Stufe runter bei 2 % unter Einschaltwert
+        private static readonly TimeSpan RefreshInterval = TimeSpan.FromSeconds(60);
+
+        // my-PV: true  = http://IP/control.html?power=WATT (Steuerquelle im Gerät auf "HTTP" stellen)
+        //        false = http://IP/setup.jsn?devmode=..&ptarget=.. (alte Variante)
+        // Bitte an deinem Gerät testen und ggf. umstellen.
+        private const bool MyPvUseControlHtml = true;
+
         private readonly DeviceManager _deviceManager;
-        
+
         private readonly Dictionary<string, DateTime> _pendingOnTimers = new Dictionary<string, DateTime>();
         private readonly Dictionary<string, DateTime> _pendingOffTimers = new Dictionary<string, DateTime>();
 
         private readonly Dictionary<string, int> _deviceTargets = new Dictionary<string, int>();
         private readonly Dictionary<string, DateTime> _lastAdjustments = new Dictionary<string, DateTime>();
 
+        // Zuletzt gesendete Leistung (W) je Gerät -> "eigener Verbrauch" im Überschuss
+        private readonly Dictionary<string, double> _lastPower = new Dictionary<string, double>();
+
+        // Letzter gesendeter Befehl je Gerät (nur bei Änderung / alle 60 s erneut senden)
+        private readonly Dictionary<string, (string State, DateTime At)> _lastCmd = new Dictionary<string, (string, DateTime)>();
+
+        // Steckdosen-Status: erkanntes Protokoll + Offline-Sperre
+        private readonly Dictionary<string, int> _protocol = new Dictionary<string, int>();
+        private readonly Dictionary<string, DateTime> _offlineUntil = new Dictionary<string, DateTime>();
+
         private static readonly HttpClient _httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+
+        private sealed class Ctx
+        {
+            public double Soc;
+            public double BatteryPower;   // + laden / - entladen
+            public double Surplus;        // + Einspeisung / - Netzbezug (vorzeichenbehaftet!)
+        }
+
+        private sealed record VictronData(
+            double Soc, double Voltage, double Grid, double Pv, double AcLoad,
+            double G1, double G2, double G3, double Ac1, double Ac2, double Ac3, double BatteryPower);
 
         public AutomationEngine(DeviceManager deviceManager)
         {
             _deviceManager = deviceManager;
         }
 
+        // =====================================================================
+        // HAUPTSCHLEIFE
+        // =====================================================================
         public async Task StartAsync()
         {
             Console.WriteLine("==================================================");
@@ -34,399 +70,274 @@ namespace VictronEasyManager
             Console.WriteLine("==================================================");
 
             using var client = new ModbusTcpClient();
+            string? connectedIp = null;
 
             while (true)
             {
                 try
                 {
-                    string aktuelleVictronIp = _deviceManager.Settings.VictronIp;
+                    string victronIp = _deviceManager.Settings.VictronIp;
 
-                    if (string.IsNullOrWhiteSpace(aktuelleVictronIp))
+                    if (string.IsNullOrWhiteSpace(victronIp))
                     {
                         Console.WriteLine("[INFO] Warte auf Victron Cerbo IP... (Bitte im Dashboard eintragen!)");
                         await Task.Delay(5000);
                         continue;
                     }
 
-                    if (!client.IsConnected) 
-                    { 
-                        Console.WriteLine($"[VERBINDUNG] Verbinde mit Victron unter: {aktuelleVictronIp} ...");
-                        client.Connect(aktuelleVictronIp); 
+                    // IP im Dashboard geändert -> neu verbinden
+                    if (client.IsConnected && connectedIp != victronIp) client.Disconnect();
+                    if (!client.IsConnected)
+                    {
+                        Console.WriteLine($"[VERBINDUNG] Verbinde mit Victron unter: {victronIp} ...");
+                        client.Connect(victronIp);
+                        connectedIp = victronIp;
                     }
 
-                    var (currentSoc, currentVoltage, currentGridPower, currentPv, currentAc, g1, g2, g3, ac1, ac2, ac3) = ReadVictronData(client);
-                    
-                    _deviceManager.LiveSoc = currentSoc;
-                    _deviceManager.LiveVoltage = currentVoltage;
-                    _deviceManager.LiveGrid = currentGridPower;
-                    _deviceManager.LivePv = currentPv;
-                    _deviceManager.LiveAcLoad = currentAc;
-                    
-                    _deviceManager.LiveGridL1 = g1;
-                    _deviceManager.LiveGridL2 = g2;
-                    _deviceManager.LiveGridL3 = g3;
-                    
-                    _deviceManager.LiveAcL1 = ac1;
-                    _deviceManager.LiveAcL2 = ac2;
-                    _deviceManager.LiveAcL3 = ac3;
+                    // Wirft bei Lesefehlern eine Exception -> Zyklus wird übersprungen (kein Schalten mit Nullwerten)
+                    var v = ReadVictronData(client);
 
-                    double calcBatteryCharge = currentPv - currentAc + currentGridPower;
+                    _deviceManager.LiveSoc = v.Soc;
+                    _deviceManager.LiveVoltage = v.Voltage;
+                    _deviceManager.LiveGrid = v.Grid;
+                    _deviceManager.LivePv = v.Pv;
+                    _deviceManager.LiveAcLoad = v.AcLoad;
+                    _deviceManager.LiveBatteryPower = v.BatteryPower;
+                    _deviceManager.LiveGridL1 = v.G1;
+                    _deviceManager.LiveGridL2 = v.G2;
+                    _deviceManager.LiveGridL3 = v.G3;
+                    _deviceManager.LiveAcL1 = v.Ac1;
+                    _deviceManager.LiveAcL2 = v.Ac2;
+                    _deviceManager.LiveAcL3 = v.Ac3;
+                    _deviceManager.LastLiveUpdate = DateTime.UtcNow;
 
-                    Console.WriteLine($"[LIVE] SOC: {currentSoc}% | PV: {currentPv}W | AC-Last: {currentAc}W | Netz: {currentGridPower}W | Akku lädt mit: {calcBatteryCharge}W");
+                    Console.WriteLine($"[LIVE] SOC: {v.Soc}% | PV: {v.Pv}W | AC-Last: {v.AcLoad}W | Netz: {v.Grid}W | Akku: {v.BatteryPower}W");
 
-                    // ==========================================================
-                    // NEU: Priorisierung und Virtueller Überschuss
-                    // ==========================================================
-                    // Geräte nach Priorität sortieren (1 = höchste)
+                    var ctx = new Ctx
+                    {
+                        Soc = v.Soc,
+                        BatteryPower = v.BatteryPower,
+                        Surplus = -v.Grid   // negativ = Netzbezug
+                    };
+
                     var devices = _deviceManager.GetAllDevices().OrderBy(d => d.Priority).ToList();
-                    
-                    // Den verfügbaren Überschuss ermitteln (Negativer Netzbezug = Einspeisung)
-                    double virtualSurplus = currentGridPower < 0 ? Math.Abs(currentGridPower) : 0;
+                    PruneState(devices);
 
                     foreach (var device in devices)
                     {
-                        // ==========================================================
-                        // MANUELLE ÜBERSTEUERUNG
-                        // ==========================================================
-                        if (device.SystemType == "cascade")
-                        {
-                            if (device.ManualOverride == "off") {
-                                if (device.CurrentCascadeStep != 0) {
-                                    device.CurrentCascadeStep = 0;
-                                    _deviceManager.SaveDevices();
-                                    await ApplyCascadeStateAsync(device);
-                                }
-                                continue;
-                            }
-                            else if (device.ManualOverride == "on") {
-                                if (device.CurrentCascadeStep != 3) {
-                                    device.CurrentCascadeStep = 3;
-                                    _deviceManager.SaveDevices();
-                                    await ApplyCascadeStateAsync(device);
-                                }
-                                continue;
-                            }
-                        }
-                        else
-                        {
-                            if (device.ManualOverride == "off") {
-                                if (device.IsOn) {
-                                    device.IsOn = false; _deviceManager.SaveDevices();
-                                    await ApplyManualStateAsync(device, false);
-                                }
-                                continue; 
-                            }
-                            else if (device.ManualOverride == "on") {
-                                if (!device.IsOn) {
-                                    device.IsOn = true; _deviceManager.SaveDevices();
-                                    await ApplyManualStateAsync(device, true);
-                                }
-                                continue; 
-                            }
-                        }
-
-                        // ==========================================================
-                        // KASKADEN-WEICHE (3-Phasen-Heizstab)
-                        // ==========================================================
-                        if (device.SystemType == "cascade")
-                        {
-                            int desiredStep = device.CurrentCascadeStep;
-
-                            if (device.ControlMode == "soc")
-                            {
-                                if (currentSoc >= device.OnValue3) desiredStep = 3;
-                                else if (currentSoc >= device.OnValue2) desiredStep = 2;
-                                else if (currentSoc >= device.OnValue) desiredStep = 1;
-                                else if (currentSoc < device.OffValue) desiredStep = 0;
-                            }
-                            else // Grid Mode
-                            {
-                                if (device.CurrentCascadeStep == 0 && virtualSurplus >= device.OnValue) { 
-                                    desiredStep = 1; virtualSurplus -= device.OnValue; 
-                                }
-                                else if (device.CurrentCascadeStep == 1) {
-                                    if (virtualSurplus >= device.OnValue2) { desiredStep = 2; virtualSurplus -= device.OnValue2; }
-                                    else if (virtualSurplus < device.OffValue) { desiredStep = 0; }
-                                }
-                                else if (device.CurrentCascadeStep == 2) {
-                                    if (virtualSurplus >= device.OnValue3) { desiredStep = 3; virtualSurplus -= device.OnValue3; }
-                                    else if (virtualSurplus < device.OffValue) { desiredStep = 1; }
-                                }
-                                else if (device.CurrentCascadeStep == 3) {
-                                    if (virtualSurplus < device.OffValue) { desiredStep = 2; }
-                                }
-                                
-                                if (virtualSurplus < 0) virtualSurplus = 0; // Absicherung
-                            }
-
-                            if (desiredStep > device.CurrentCascadeStep)
-                            {
-                                _pendingOffTimers.Remove(device.Id);
-                                if (!_pendingOnTimers.ContainsKey(device.Id)) _pendingOnTimers[device.Id] = DateTime.Now;
-                                else if ((DateTime.Now - _pendingOnTimers[device.Id]).TotalMinutes >= device.OnDelayMinutes) {
-                                    device.CurrentCascadeStep = desiredStep; _deviceManager.SaveDevices(); _pendingOnTimers.Remove(device.Id);
-                                    _ = ApplyCascadeStateAsync(device);
-                                }
-                            }
-                            else if (desiredStep < device.CurrentCascadeStep)
-                            {
-                                _pendingOnTimers.Remove(device.Id);
-                                if (!_pendingOffTimers.ContainsKey(device.Id)) _pendingOffTimers[device.Id] = DateTime.Now;
-                                else if ((DateTime.Now - _pendingOffTimers[device.Id]).TotalMinutes >= device.OffDelayMinutes) {
-                                    device.CurrentCascadeStep = desiredStep; _deviceManager.SaveDevices(); _pendingOffTimers.Remove(device.Id);
-                                    _ = ApplyCascadeStateAsync(device);
-                                }
-                            }
-                            else 
-                            {
-                                _pendingOnTimers.Remove(device.Id);
-                                _pendingOffTimers.Remove(device.Id);
-                            }
-                            
-                            continue;
-                        }
-
-                        // ==========================================================
-                        // HEIZSTAB-WEICHE (Stufenlos my-PV)
-                        // ==========================================================
-                        if (device.SystemType == "heater" && device.DeviceModel == "mypv")
-                        {
-                            int targetWatt = 0;
-
-                            if (device.ControlMode == "soc")
-                            {
-                                if (currentSoc >= device.OnValue) targetWatt = 3000; 
-                                else if (currentSoc < device.OffValue) targetWatt = 0;
-                                else targetWatt = device.IsOn ? 1500 : 0; 
-                            }
-                            else if (device.ControlMode == "soc_pv")
-                            {
-                                bool allowHeat = false;
-                                if (currentSoc >= device.OnValue) allowHeat = true;
-                                else if (currentSoc < device.OffValue) allowHeat = false;
-                                else allowHeat = device.IsOn;
-
-                                if (allowHeat)
-                                {
-                                    if (!_deviceTargets.ContainsKey(device.Id)) _deviceTargets[device.Id] = 0;
-                                    if (!_lastAdjustments.ContainsKey(device.Id)) _lastAdjustments[device.Id] = DateTime.Now.AddSeconds(-20);
-
-                                    targetWatt = _deviceTargets[device.Id];
-
-                                    if ((DateTime.Now - _lastAdjustments[device.Id]).TotalSeconds >= 15)
-                                    {
-                                        if (calcBatteryCharge > 400) { targetWatt += 200; } 
-                                        else if (calcBatteryCharge < -200) { targetWatt -= 200; } 
-
-                                        if (targetWatt < 0) targetWatt = 0;
-                                        if (targetWatt > 3000) targetWatt = 3000;
-
-                                        if (targetWatt != _deviceTargets[device.Id]) {
-                                            _deviceTargets[device.Id] = targetWatt;
-                                            _lastAdjustments[device.Id] = DateTime.Now;
-                                        }
-                                    }
-                                }
-                            }
-                            else // Grid Mode
-                            {
-                                targetWatt = (int)Math.Floor(virtualSurplus);
-                                if (targetWatt > 3000) targetWatt = 3000;
-                                
-                                // Reservierung vom virtuellen Überschuss
-                                if (targetWatt > 0) {
-                                    virtualSurplus -= targetWatt;
-                                    if (virtualSurplus < 0) virtualSurplus = 0;
-                                }
-                            }
-
-                            bool desiredHeat = targetWatt > 0;
-
-                            if (desiredHeat && !device.IsOn)
-                            {
-                                _pendingOffTimers.Remove(device.Id);
-                                if (!_pendingOnTimers.ContainsKey(device.Id)) _pendingOnTimers[device.Id] = DateTime.Now;
-                                else if ((DateTime.Now - _pendingOnTimers[device.Id]).TotalMinutes >= device.OnDelayMinutes) {
-                                    device.IsOn = true; _deviceManager.SaveDevices(); _pendingOnTimers.Remove(device.Id);
-                                }
-                            }
-                            else if (!desiredHeat && device.IsOn)
-                            {
-                                _pendingOnTimers.Remove(device.Id);
-                                if (!_pendingOffTimers.ContainsKey(device.Id)) _pendingOffTimers[device.Id] = DateTime.Now;
-                                else if ((DateTime.Now - _pendingOffTimers[device.Id]).TotalMinutes >= device.OffDelayMinutes) {
-                                    device.IsOn = false; _deviceManager.SaveDevices(); _pendingOffTimers.Remove(device.Id);
-                                }
-                                else { targetWatt = 0; } 
-                            }
-                            else 
-                            {
-                                _pendingOnTimers.Remove(device.Id);
-                                _pendingOffTimers.Remove(device.Id);
-                            }
-
-                            int finalWatt = device.IsOn ? targetWatt : 0;
-                            await SendMyPvCommandAsync(device.IpAddress, finalWatt);
-                            
-                            continue; 
-                        }
-
-                        // ==========================================================
-                        // WALLBOX-WEICHE
-                        // ==========================================================
-                        if (device.SystemType == "wallbox")
-                        {
-                            bool desiredAllowCharge = false;
-                            int desiredAmpere = 6;
-
-                            if (device.ControlMode == "soc")
-                            {
-                                if (currentSoc >= device.OnValue) { desiredAllowCharge = true; desiredAmpere = 16; }
-                                else if (currentSoc < device.OffValue) { desiredAllowCharge = false; }
-                                else { desiredAllowCharge = device.IsOn; desiredAmpere = 10; }
-                            }
-                            else if (device.ControlMode == "soc_pv")
-                            {
-                                if (currentSoc >= device.OnValue) desiredAllowCharge = true;
-                                else if (currentSoc < device.OffValue) desiredAllowCharge = false;
-                                else desiredAllowCharge = device.IsOn;
-
-                                if (desiredAllowCharge)
-                                {
-                                    if (!_deviceTargets.ContainsKey(device.Id)) _deviceTargets[device.Id] = 6;
-                                    if (!_lastAdjustments.ContainsKey(device.Id)) _lastAdjustments[device.Id] = DateTime.Now.AddSeconds(-20);
-
-                                    desiredAmpere = _deviceTargets[device.Id];
-
-                                    if ((DateTime.Now - _lastAdjustments[device.Id]).TotalSeconds >= 15)
-                                    {
-                                        if (calcBatteryCharge > 500) { desiredAmpere++; } 
-                                        else if (calcBatteryCharge < -200) { desiredAmpere--; } 
-
-                                        if (desiredAmpere < 6) desiredAmpere = 6;
-                                        if (desiredAmpere > 16) desiredAmpere = 16;
-
-                                        if (desiredAmpere != _deviceTargets[device.Id]) {
-                                            _deviceTargets[device.Id] = desiredAmpere;
-                                            _lastAdjustments[device.Id] = DateTime.Now;
-                                        }
-                                    }
-                                }
-                            }
-                            else // Grid Mode
-                            {
-                                desiredAmpere = (int)Math.Floor(virtualSurplus / 690.0);
-
-                                if (desiredAmpere >= 6) { 
-                                    if (desiredAmpere > 16) desiredAmpere = 16; 
-                                    desiredAllowCharge = true; 
-                                    
-                                    // Reservierung vom virtuellen Überschuss
-                                    virtualSurplus -= (desiredAmpere * 690.0);
-                                    if (virtualSurplus < 0) virtualSurplus = 0;
-                                }
-                                else { desiredAllowCharge = false; desiredAmpere = 6; }
-                            }
-
-                            if (desiredAllowCharge && !device.IsOn)
-                            {
-                                _pendingOffTimers.Remove(device.Id);
-                                if (!_pendingOnTimers.ContainsKey(device.Id)) _pendingOnTimers[device.Id] = DateTime.Now;
-                                else if ((DateTime.Now - _pendingOnTimers[device.Id]).TotalMinutes >= device.OnDelayMinutes) {
-                                    device.IsOn = true; _deviceManager.SaveDevices(); _pendingOnTimers.Remove(device.Id);
-                                }
-                            }
-                            else if (!desiredAllowCharge && device.IsOn)
-                            {
-                                _pendingOnTimers.Remove(device.Id);
-                                if (!_pendingOffTimers.ContainsKey(device.Id)) _pendingOffTimers[device.Id] = DateTime.Now;
-                                else if ((DateTime.Now - _pendingOffTimers[device.Id]).TotalMinutes >= device.OffDelayMinutes) {
-                                    device.IsOn = false; _deviceManager.SaveDevices(); _pendingOffTimers.Remove(device.Id);
-                                }
-                                else { desiredAllowCharge = true; desiredAmpere = 6; } 
-                            }
-                            else
-                            {
-                                _pendingOnTimers.Remove(device.Id);
-                                _pendingOffTimers.Remove(device.Id);
-                            }
-
-                            bool finalAllowCharge = device.IsOn;
-                            int finalAmpere = finalAllowCharge ? desiredAmpere : 6;
-
-                            if (device.DeviceModel == "goe") await SendGoeCommandAsync(device.IpAddress, finalAllowCharge, finalAmpere);
-                            else if (device.DeviceModel == "keba") await SendKebaCommandAsync(device.IpAddress, finalAllowCharge, finalAmpere);
-                            else if (device.DeviceModel == "heidelberg") await SendHeidelbergCommandAsync(device.IpAddress, finalAllowCharge, finalAmpere);
-                            else if (device.DeviceModel == "openwb") await SendOpenWbCommandAsync(device.IpAddress, finalAllowCharge, finalAmpere, isV2: false);
-                            else if (device.DeviceModel == "openwb2") await SendOpenWbCommandAsync(device.IpAddress, finalAllowCharge, finalAmpere, isV2: true);
-
-                            continue; 
-                        }
-
-                        // ==========================================================
-                        // STECKDOSEN LOGIK (Grid / Island)
-                        // ==========================================================
-                        bool? echterStatus = await FrageGeraeteStatusAbAsync(device);
-                        if (echterStatus.HasValue && device.IsOn != echterStatus.Value)
-                        {
-                            device.IsOn = echterStatus.Value; 
-                            _deviceManager.SaveDevices(); 
-                        }
-
-                        bool shouldBeOn = false;
-                        bool shouldBeOff = false;
-
-                        if (device.SystemType == "grid")
-                        {
-                            if (virtualSurplus >= device.OnValue) { 
-                                shouldBeOn = true; 
-                                
-                                // Reservierung vom virtuellen Überschuss (nur wenn es noch nicht an ist, 
-                                // da der reale Überschuss sonst verfälscht wird)
-                                if (!device.IsOn) {
-                                    virtualSurplus -= device.OnValue;
-                                    if (virtualSurplus < 0) virtualSurplus = 0;
-                                }
-                            }
-                            else if (virtualSurplus < device.OffValue) { shouldBeOff = true; }
-                        }
-                        else if (device.SystemType == "island")
-                        {
-                            if (currentSoc >= device.OnValue) { shouldBeOn = true; }
-                            else if (currentSoc < device.OffValue) { shouldBeOff = true; }
-                        }
-
-                        if (shouldBeOn && !device.IsOn)
-                        {
-                            _pendingOffTimers.Remove(device.Id);
-                            if (!_pendingOnTimers.ContainsKey(device.Id)) _pendingOnTimers[device.Id] = DateTime.Now;
-                            else if ((DateTime.Now - _pendingOnTimers[device.Id]).TotalMinutes >= device.OnDelayMinutes) {
-                                device.IsOn = true; _deviceManager.SaveDevices(); _pendingOnTimers.Remove(device.Id);
-                                _ = SendSwitchCommandAsync(device, true);
-                            }
-                        }
-                        else { _pendingOnTimers.Remove(device.Id); }
-
-                        if (shouldBeOff && device.IsOn)
-                        {
-                            _pendingOnTimers.Remove(device.Id);
-                            if (!_pendingOffTimers.ContainsKey(device.Id)) _pendingOffTimers[device.Id] = DateTime.Now;
-                            else if ((DateTime.Now - _pendingOffTimers[device.Id]).TotalMinutes >= device.OffDelayMinutes) {
-                                device.IsOn = false; _deviceManager.SaveDevices(); _pendingOffTimers.Remove(device.Id);
-                                _ = SendSwitchCommandAsync(device, false);
-                            }
-                        }
-                        else { _pendingOffTimers.Remove(device.Id); }
+                        try { await ProcessDeviceAsync(device, ctx); }
+                        catch (Exception ex) { Console.WriteLine($"[FEHLER] Gerät '{device.Name}': {ex.Message}"); }
                     }
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine($"[FEHLER] Modbus-Verbindung unterbrochen: {ex.Message}");
-                    if (client.IsConnected) { client.Disconnect(); }
+                    try { if (client.IsConnected) client.Disconnect(); } catch { }
                 }
 
-                await Task.Delay(5000); 
+                await Task.Delay(5000);
             }
+        }
+
+        private async Task ProcessDeviceAsync(ShellyDevice device, Ctx c)
+        {
+            if (device.ManualOverride == "on" || device.ManualOverride == "off")
+            {
+                await HandleManualAsync(device, device.ManualOverride == "on");
+                return;
+            }
+
+            switch (device.SystemType)
+            {
+                case "cascade": ProcessCascade(device, c); break;
+                case "heater" when device.DeviceModel == "mypv": await ProcessMyPvAsync(device, c); break;
+                case "wallbox": await ProcessWallboxAsync(device, c); break;
+                default: await ProcessSwitchAsync(device, c); break;
+            }
+        }
+
+        // =====================================================================
+        // HILFSFUNKTIONEN
+        // =====================================================================
+        private void PruneState(List<ShellyDevice> devices)
+        {
+            var ids = devices.Select(d => d.Id).ToHashSet();
+            Prune(_pendingOnTimers, ids);
+            Prune(_pendingOffTimers, ids);
+            Prune(_deviceTargets, ids);
+            Prune(_lastAdjustments, ids);
+            Prune(_lastPower, ids);
+            Prune(_lastCmd, ids);
+            Prune(_protocol, ids);
+            Prune(_offlineUntil, ids);
+        }
+
+        private static void Prune<T>(Dictionary<string, T> dict, HashSet<string> ids)
+        {
+            foreach (var key in dict.Keys.Where(k => !ids.Contains(k)).ToList()) dict.Remove(key);
+        }
+
+        // true, sobald die Verzögerung abgelaufen ist (bei 0 Minuten sofort)
+        private bool DelayElapsed(Dictionary<string, DateTime> timers, string id, int minutes)
+        {
+            if (minutes <= 0) { timers.Remove(id); return true; }
+            if (!timers.TryGetValue(id, out var start)) { timers[id] = DateTime.UtcNow; return false; }
+            if ((DateTime.UtcNow - start).TotalMinutes >= minutes) { timers.Remove(id); return true; }
+            return false;
+        }
+
+        // Prüft, ob ein Zustandswechsel jetzt fällig ist (desired == null -> halten)
+        private bool StateChangeDue(ShellyDevice device, bool? desired, int onDelay, int offDelay)
+        {
+            if (desired == true && !device.IsOn)
+            {
+                _pendingOffTimers.Remove(device.Id);
+                return DelayElapsed(_pendingOnTimers, device.Id, onDelay);
+            }
+            if (desired == false && device.IsOn)
+            {
+                _pendingOnTimers.Remove(device.Id);
+                return DelayElapsed(_pendingOffTimers, device.Id, offDelay);
+            }
+            _pendingOnTimers.Remove(device.Id);
+            _pendingOffTimers.Remove(device.Id);
+            return false;
+        }
+
+        // Befehl nur senden, wenn er sich geändert hat (oder alle 60 s als Auffrischung)
+        private bool ShouldSend(string id, string state, bool refresh = true)
+        {
+            var now = DateTime.UtcNow;
+            if (_lastCmd.TryGetValue(id, out var last) && last.State == state && (!refresh || now - last.At < RefreshInterval))
+                return false;
+            _lastCmd[id] = (state, now);
+            return true;
+        }
+
+        private static bool SocAllowed(ShellyDevice d, double soc)
+            => soc >= d.OnValue || (soc >= d.OffValue && d.IsOn);
+
+        // Stufenweises Nachregeln (alle 15 s) anhand der Batterieleistung
+        private int AdjustTarget(string id, int start, int step, int min, int max, double charge, double upThreshold, double downThreshold)
+        {
+            if (!_deviceTargets.TryGetValue(id, out int target)) target = start;
+            if (!_lastAdjustments.TryGetValue(id, out var last)) last = DateTime.UtcNow.AddSeconds(-20);
+
+            if ((DateTime.UtcNow - last).TotalSeconds >= 15)
+            {
+                int n = target;
+                if (charge > upThreshold) n += step;
+                else if (charge < downThreshold) n -= step;
+                n = Math.Clamp(n, min, max);
+                if (n != target) { target = n; _lastAdjustments[id] = DateTime.UtcNow; }
+            }
+            _deviceTargets[id] = target;
+            return target;
+        }
+
+        // =====================================================================
+        // MANUELLE ÜBERSTEUERUNG
+        // =====================================================================
+        private async Task HandleManualAsync(ShellyDevice device, bool on)
+        {
+            if (device.SystemType == "cascade")
+            {
+                int step = on ? 3 : 0;
+                if (device.CurrentCascadeStep != step) { device.CurrentCascadeStep = step; _deviceManager.SaveDevices(); }
+                if (ShouldSend(device.Id, $"step{step}")) _ = ApplyCascadeStateAsync(device);
+                return;
+            }
+
+            if (device.IsOn != on) { device.IsOn = on; _deviceManager.SaveDevices(); }
+
+            if (device.SystemType == "heater") _lastPower[device.Id] = on ? MaxHeaterWatt : 0;
+            else if (device.SystemType == "wallbox") _lastPower[device.Id] = on ? MaxAmpere * WattPerAmpere : 0;
+
+            // Eigene HTTP-URLs könnten Toggles sein -> dort nicht auffrischen
+            bool refresh = device.DeviceModel != "custom";
+            if (ShouldSend(device.Id, $"manual:{on}", refresh))
+                await ApplyManualStateAsync(device, on);
+        }
+
+        private async Task ApplyManualStateAsync(ShellyDevice device, bool turnOn)
+        {
+            if (device.SystemType == "heater" && device.DeviceModel == "mypv")
+                await SendMyPvCommandAsync(device.IpAddress, turnOn ? MaxHeaterWatt : 0);
+            else if (device.SystemType == "wallbox")
+                await SendWallboxAsync(device, turnOn, turnOn ? MaxAmpere : 6);
+            else
+                await SendSwitchCommandAsync(device, turnOn);
+        }
+
+        // =====================================================================
+        // KASKADE (3-Phasen-Heizstab)
+        // =====================================================================
+        private void ProcessCascade(ShellyDevice device, Ctx c)
+        {
+            int current = device.CurrentCascadeStep;
+            int desired = current;
+
+            if (device.ControlMode == "soc")
+            {
+                // Hochschalten
+                if (c.Soc >= device.OnValue3) desired = 3;
+                else if (c.Soc >= device.OnValue2 && desired < 2) desired = 2;
+                else if (c.Soc >= device.OnValue && desired < 1) desired = 1;
+
+                // Runterschalten mit Hysterese (verhindert Flattern zwischen den Stufen)
+                if (desired >= 3 && c.Soc < device.OnValue3 - SocHysteresis) desired = 2;
+                if (desired >= 2 && c.Soc < device.OnValue2 - SocHysteresis) desired = 1;
+                if (desired >= 1 && c.Soc < device.OffValue) desired = 0;
+            }
+            else // Netz-Modus (c.Surplus ist vorzeichenbehaftet)
+            {
+                if (current == 0)
+                {
+                    if (c.Surplus >= device.OnValue) { desired = 1; c.Surplus -= device.OnValue; }
+                }
+                else if (current == 1)
+                {
+                    if (c.Surplus >= device.OnValue2) { desired = 2; c.Surplus -= device.OnValue2; }
+                    else if (c.Surplus < device.OffValue) desired = 0;
+                }
+                else if (current == 2)
+                {
+                    if (c.Surplus >= device.OnValue3) { desired = 3; c.Surplus -= device.OnValue3; }
+                    else if (c.Surplus < device.OffValue) desired = 1;
+                }
+                else
+                {
+                    if (c.Surplus < device.OffValue) desired = 2;
+                }
+            }
+
+            if (desired > current)
+            {
+                _pendingOffTimers.Remove(device.Id);
+                if (DelayElapsed(_pendingOnTimers, device.Id, device.OnDelayMinutes))
+                {
+                    device.CurrentCascadeStep = desired;
+                    _deviceManager.SaveDevices();
+                }
+            }
+            else if (desired < current)
+            {
+                _pendingOnTimers.Remove(device.Id);
+                if (DelayElapsed(_pendingOffTimers, device.Id, device.OffDelayMinutes))
+                {
+                    device.CurrentCascadeStep = desired;
+                    _deviceManager.SaveDevices();
+                }
+            }
+            else
+            {
+                _pendingOnTimers.Remove(device.Id);
+                _pendingOffTimers.Remove(device.Id);
+            }
+
+            // Bei Änderung sofort, sonst alle 60 s zur Synchronisation
+            if (ShouldSend(device.Id, $"step{device.CurrentCascadeStep}"))
+                _ = ApplyCascadeStateAsync(device);
         }
 
         private async Task ApplyCascadeStateAsync(ShellyDevice device)
@@ -440,64 +351,285 @@ namespace VictronEasyManager
             if (!string.IsNullOrWhiteSpace(device.IpAddress3)) await SendRelayCommandAsync(device.IpAddress3, st3);
         }
 
-        private async Task SendRelayCommandAsync(string ip, bool turnOn)
+        // =====================================================================
+        // HEIZSTAB (stufenlos, my-PV)
+        // =====================================================================
+        private async Task ProcessMyPvAsync(ShellyDevice device, Ctx c)
         {
-            if (string.IsNullOrWhiteSpace(ip) || ip == "0.0.0.0") return;
-            string actionGen1 = turnOn ? "on" : "off";
-            string actionGen2 = turnOn ? "true" : "false";
-            string actionTasmota = turnOn ? "On" : "Off"; 
-            try { var res = await _httpClient.GetAsync($"http://{ip}/cm?cmnd=Power%20{actionTasmota}"); if (res.IsSuccessStatusCode) return; } catch { } 
-            try { var res = await _httpClient.GetAsync($"http://{ip}/relay/0?turn={actionGen1}"); if (res.IsSuccessStatusCode) return; } catch { } 
-            try { var res = await _httpClient.GetAsync($"http://{ip}/rpc/Switch.Set?id=0&on={actionGen2}"); if (res.IsSuccessStatusCode) return; } catch { } 
+            _lastPower.TryGetValue(device.Id, out double lastPower);
+            double own = device.IsOn ? lastPower : 0;   // eigener Verbrauch steckt schon in der Netzmessung
+            int targetWatt = 0;
+
+            if (device.ControlMode == "soc")
+            {
+                if (c.Soc >= device.OnValue) targetWatt = MaxHeaterWatt;
+                else if (c.Soc < device.OffValue) targetWatt = 0;
+                else targetWatt = device.IsOn ? MaxHeaterWatt / 2 : 0;
+            }
+            else if (device.ControlMode == "soc_pv")
+            {
+                if (SocAllowed(device, c.Soc))
+                    targetWatt = AdjustTarget(device.Id, 0, 200, 0, MaxHeaterWatt, c.BatteryPower, 400, -200);
+                else
+                    _deviceTargets[device.Id] = 0;
+            }
+            else // Netz-Modus
+            {
+                targetWatt = (int)Math.Clamp(Math.Floor(c.Surplus + own), 0, MaxHeaterWatt);
+                targetWatt = targetWatt / 50 * 50;      // 50-W-Raster gegen ständiges Flattern
+                c.Surplus -= (targetWatt - own);        // nur die Differenz reservieren
+            }
+
+            // Verzögerungen nur im Netz-Modus (im UI nur dort einstellbar)
+            int onDelay = device.ControlMode == "grid" ? device.OnDelayMinutes : 0;
+            int offDelay = device.ControlMode == "grid" ? device.OffDelayMinutes : 0;
+
+            bool desiredHeat = targetWatt > 0;
+            if (StateChangeDue(device, desiredHeat, onDelay, offDelay))
+            {
+                device.IsOn = desiredHeat;
+                _deviceManager.SaveDevices();
+            }
+
+            // Ausschaltverzögerung läuft: letzte Leistung halten
+            if (!desiredHeat && device.IsOn) targetWatt = (int)lastPower;
+
+            int finalWatt = device.IsOn ? targetWatt : 0;
+            _lastPower[device.Id] = finalWatt;
+
+            if (ShouldSend(device.Id, finalWatt.ToString()))
+                await SendMyPvCommandAsync(device.IpAddress, finalWatt);
         }
 
-        private async Task ApplyManualStateAsync(ShellyDevice device, bool turnOn)
+        // =====================================================================
+        // WALLBOX
+        // =====================================================================
+        private async Task ProcessWallboxAsync(ShellyDevice device, Ctx c)
         {
-            if (device.SystemType == "heater" && device.DeviceModel == "mypv")
+            _lastPower.TryGetValue(device.Id, out double lastPower);
+            double own = device.IsOn ? lastPower : 0;
+
+            bool allow = false;
+            int amp = 6;
+
+            if (device.ControlMode == "soc")
             {
-                await SendMyPvCommandAsync(device.IpAddress, turnOn ? 3000 : 0); 
+                if (c.Soc >= device.OnValue) { allow = true; amp = MaxAmpere; }
+                else if (c.Soc < device.OffValue) { allow = false; }
+                else { allow = device.IsOn; amp = 10; }
             }
-            else if (device.SystemType == "wallbox")
+            else if (device.ControlMode == "soc_pv")
             {
-                int amp = turnOn ? 16 : 6;
-                if (device.DeviceModel == "goe") await SendGoeCommandAsync(device.IpAddress, turnOn, amp);
-                else if (device.DeviceModel == "keba") await SendKebaCommandAsync(device.IpAddress, turnOn, amp);
-                else if (device.DeviceModel == "heidelberg") await SendHeidelbergCommandAsync(device.IpAddress, turnOn, amp);
-                else if (device.DeviceModel == "openwb") await SendOpenWbCommandAsync(device.IpAddress, turnOn, amp, isV2: false);
-                else if (device.DeviceModel == "openwb2") await SendOpenWbCommandAsync(device.IpAddress, turnOn, amp, isV2: true);
+                allow = SocAllowed(device, c.Soc);
+                if (allow) amp = AdjustTarget(device.Id, 6, 1, 6, MaxAmpere, c.BatteryPower, 500, -200);
+                else _deviceTargets[device.Id] = 6;
+            }
+            else // Netz-Modus
+            {
+                int a = (int)Math.Floor((c.Surplus + own) / WattPerAmpere);
+                if (a >= 6)
+                {
+                    amp = Math.Min(a, MaxAmpere);
+                    allow = true;
+                    c.Surplus -= (amp * WattPerAmpere - own);
+                }
+                else { allow = false; amp = 6; }
+            }
+
+            int onDelay = device.ControlMode == "grid" ? device.OnDelayMinutes : 0;
+            int offDelay = device.ControlMode == "grid" ? device.OffDelayMinutes : 0;
+
+            if (StateChangeDue(device, allow, onDelay, offDelay))
+            {
+                device.IsOn = allow;
+                _deviceManager.SaveDevices();
+            }
+
+            // Ausschaltverzögerung läuft: mit Minimalstrom weiterladen
+            if (!allow && device.IsOn) { allow = true; amp = 6; }
+
+            bool finalAllow = device.IsOn;
+            int finalAmp = finalAllow ? amp : 6;
+            _lastPower[device.Id] = finalAllow ? finalAmp * WattPerAmpere : 0;
+
+            if (ShouldSend(device.Id, $"{finalAllow}:{finalAmp}"))
+                await SendWallboxAsync(device, finalAllow, finalAmp);
+        }
+
+        private async Task SendWallboxAsync(ShellyDevice device, bool allow, int amp)
+        {
+            switch (device.DeviceModel)
+            {
+                case "goe": await SendGoeCommandAsync(device.IpAddress, allow, amp); break;
+                case "keba": await SendKebaCommandAsync(device.IpAddress, allow, amp); break;
+                case "heidelberg": await SendHeidelbergCommandAsync(device.IpAddress, allow, amp); break;
+                case "openwb": await SendOpenWbCommandAsync(device.IpAddress, allow, amp, isV2: false); break;
+                case "openwb2": await SendOpenWbCommandAsync(device.IpAddress, allow, amp, isV2: true); break;
+            }
+        }
+
+        // =====================================================================
+        // STECKDOSEN (Netz / Insel)
+        // =====================================================================
+        private async Task ProcessSwitchAsync(ShellyDevice device, Ctx c)
+        {
+            bool? real = await FrageGeraeteStatusAbAsync(device);
+            if (real.HasValue && device.IsOn != real.Value)
+            {
+                device.IsOn = real.Value;
+                _deviceManager.SaveDevices();
+            }
+
+            // Gerät nicht erreichbar -> nicht schalten, Sperre läuft (siehe FrageGeraeteStatusAbAsync)
+            if (real == null && device.DeviceModel != "custom") return;
+
+            bool? desired = null;
+
+            if (device.SystemType == "grid")
+            {
+                if (c.Surplus >= device.OnValue)
+                {
+                    desired = true;
+                    // Nur reservieren, wenn es noch nicht läuft (sonst steckt der Verbrauch schon in der Messung)
+                    if (!device.IsOn) c.Surplus -= device.OnValue;
+                }
+                else if (c.Surplus < device.OffValue) desired = false;
+            }
+            else if (device.SystemType == "island")
+            {
+                if (c.Soc >= device.OnValue) desired = true;
+                else if (c.Soc < device.OffValue) desired = false;
+            }
+            else return;
+
+            if (StateChangeDue(device, desired, device.OnDelayMinutes, device.OffDelayMinutes))
+            {
+                bool target = desired!.Value;
+                if (await SendSwitchCommandAsync(device, target))
+                {
+                    device.IsOn = target;
+                    _deviceManager.SaveDevices();
+                }
+            }
+        }
+
+        private async Task<bool> SendSwitchCommandAsync(ShellyDevice device, bool turnOn)
+        {
+            if (device.DeviceModel == "custom")
+            {
+                string url = turnOn ? device.CustomOnUrl : device.CustomOffUrl;
+                if (string.IsNullOrWhiteSpace(url)) return true;
+                try { var res = await _httpClient.GetAsync(url); return res.IsSuccessStatusCode; }
+                catch { return false; }
+            }
+            return await SendRelayCommandAsync(device.IpAddress, turnOn);
+        }
+
+        private async Task<bool> SendRelayCommandAsync(string ip, bool turnOn)
+        {
+            if (string.IsNullOrWhiteSpace(ip) || ip == "0.0.0.0") return false;
+
+            string[] urls =
+            {
+                $"http://{ip}/cm?cmnd=Power%20{(turnOn ? "On" : "Off")}",   // Tasmota
+                $"http://{ip}/relay/0?turn={(turnOn ? "on" : "off")}",      // Shelly Gen1
+                $"http://{ip}/rpc/Switch.Set?id=0&on={(turnOn ? "true" : "false")}" // Shelly Gen2+
+            };
+
+            foreach (var url in urls)
+            {
+                try { var res = await _httpClient.GetAsync(url); if (res.IsSuccessStatusCode) return true; }
+                catch { }
+            }
+            return false;
+        }
+
+        private async Task<bool?> FrageGeraeteStatusAbAsync(ShellyDevice device)
+        {
+            if (device.DeviceModel == "custom") return null;
+
+            string ip = device.IpAddress;
+            if (string.IsNullOrWhiteSpace(ip) || ip == "0.0.0.0") return null;
+
+            // Offline-Sperre: nicht jede Runde neu in Timeouts laufen
+            if (_offlineUntil.TryGetValue(device.Id, out var until) && DateTime.UtcNow < until) return null;
+
+            if (_protocol.TryGetValue(device.Id, out int known))
+            {
+                var r = await TryStatusAsync(ip, known);
+                if (r.HasValue) return r;
+                _protocol.Remove(device.Id);   // beim nächsten Mal neu erkennen
             }
             else
             {
-                await SendSwitchCommandAsync(device, turnOn);
+                for (int p = 0; p < 3; p++)
+                {
+                    var r = await TryStatusAsync(ip, p);
+                    if (r.HasValue) { _protocol[device.Id] = p; return r; }
+                }
             }
+
+            _offlineUntil[device.Id] = DateTime.UtcNow.AddSeconds(45);
+            return null;
         }
 
+        private static bool? ParseState(string content, string onToken, string offToken)
+            => content.Contains(onToken) ? true : content.Contains(offToken) ? false : (bool?)null;
+
+        private async Task<bool?> TryStatusAsync(string ip, int protocol)
+        {
+            try
+            {
+                string url = protocol switch
+                {
+                    0 => $"http://{ip}/cm?cmnd=Power",
+                    1 => $"http://{ip}/relay/0",
+                    _ => $"http://{ip}/rpc/Switch.GetStatus?id=0"
+                };
+                var res = await _httpClient.GetAsync(url);
+                if (!res.IsSuccessStatusCode) return null;
+                string content = await res.Content.ReadAsStringAsync();
+
+                return protocol switch
+                {
+                    0 => ParseState(content, "\"POWER\":\"ON\"", "\"POWER\":\"OFF\""),
+                    1 => ParseState(content, "\"ison\":true", "\"ison\":false"),
+                    _ => ParseState(content, "\"output\":true", "\"output\":false")
+                };
+            }
+            catch { return null; }
+        }
+
+        // =====================================================================
+        // GERÄTE-TREIBER
+        // =====================================================================
         private async Task SendMyPvCommandAsync(string ip, int watt)
         {
             if (string.IsNullOrWhiteSpace(ip) || ip == "0.0.0.0") return;
-            // Wichtig: "data.jsn" ist bei myPV (AC-Thor / AC ELWA-E / ELWA 2) ein reiner Status-Endpunkt
-            // (nur Lesen)! Hier stand sogar zusaetzlich "data.js" (falscher Dateiname, ohne "n").
-            // Zum Steuern ist "setup.jsn" mit "devmode" (0=aus, 1=an) und "ptarget"
-            // (Ziel-Netzbezugspunkt in Watt, negativ = so viel Ueberschuss soll noch eingespeist werden) noetig.
-            try {
-                string url = watt <= 0
-                    ? $"http://{ip}/setup.jsn?devmode=0"
-                    : $"http://{ip}/setup.jsn?devmode=1&ptarget=-{watt}";
+            try
+            {
+                string url;
+                if (MyPvUseControlHtml)
+                    url = $"http://{ip}/control.html?power={Math.Max(0, watt)}";
+                else
+                    url = watt <= 0
+                        ? $"http://{ip}/setup.jsn?devmode=0"
+                        : $"http://{ip}/setup.jsn?devmode=1&ptarget=-{watt}";
                 await _httpClient.GetAsync(url);
-            } catch { } 
+            }
+            catch { }
         }
 
         private async Task SendGoeCommandAsync(string ip, bool allowCharge, int ampere)
         {
             if (string.IsNullOrWhiteSpace(ip) || ip == "0.0.0.0") return;
-            try {
-                // go-eCharger API v2 (Standard seit ca. 2021, Hardware v2/v3):
-                // amp = Ladestrom (6-32A), frc = forceState (0=Automatik, 1=Aus, 2=An/Erzwingen)
-                // Vorher wurde faelschlich der alte v1-Parameter "alw" mit dem neuen v2-Pfad
-                // "/api/set" gemischt - das wird von der Box ignoriert und haette nicht funktioniert.
+            try
+            {
+                // go-eCharger API v2: amp = Ladestrom, frc = forceState (1 = Aus, 2 = An)
                 int frc = allowCharge ? 2 : 1;
                 await _httpClient.GetAsync($"http://{ip}/api/set?amp={ampere}&frc={frc}");
-            } catch { } 
+            }
+            catch { }
         }
 
         private async Task SendKebaCommandAsync(string ip, bool allowCharge, int ampere)
@@ -510,7 +642,7 @@ namespace VictronEasyManager
                 int mA = ampere * 1000;
                 byte[] currBytes = Encoding.ASCII.GetBytes($"curr {mA}");
                 await udpClient.SendAsync(currBytes, currBytes.Length, endpoint);
-                await Task.Delay(100); 
+                await Task.Delay(100);
                 int ena = allowCharge ? 1 : 0;
                 byte[] enaBytes = Encoding.ASCII.GetBytes($"ena {ena}");
                 await udpClient.SendAsync(enaBytes, enaBytes.Length, endpoint);
@@ -523,21 +655,17 @@ namespace VictronEasyManager
             if (string.IsNullOrWhiteSpace(ip) || ip == "0.0.0.0") return;
             try
             {
-                await Task.Run(() => 
+                await Task.Run(() =>
                 {
-                    // Register 261 = Maximaler Ladestrom in 0.1A (Holding Register)
-                    // Register 259 = Remote Lock: 0 = gesperrt, 1 = entriegelt (Ladefreigabe!)
-                    // Achtung: Register 258 ist NICHT die Ladefreigabe, sondern nur die interne
-                    // Standby-Stromsparfunktion - das wurde hier vorher faelschlich fuer die
-                    // Freigabe verwendet, und der Strom wurde beim Ausschalten nie auf 0 gesetzt.
+                    // Register 261 = max. Ladestrom in 0.1 A, Register 259 = Remote Lock (1 = Ladefreigabe)
                     using var hClient = new ModbusTcpClient();
-                    hClient.Connect(ip); 
-                    int deciAmpere = allowCharge ? (ampere * 10) : 0; // Beim Ausschalten wirklich auf 0
+                    hClient.Connect(ip);
+                    int deciAmpere = allowCharge ? (ampere * 10) : 0;
                     byte[] currBytes = new byte[] { (byte)(deciAmpere >> 8), (byte)(deciAmpere & 0xFF) };
-                    hClient.WriteSingleRegister(1, 261, currBytes); 
-                    int lockVal = allowCharge ? 1 : 0; // Register 259 (Remote Lock)
+                    hClient.WriteSingleRegister(1, 261, currBytes);
+                    int lockVal = allowCharge ? 1 : 0;
                     byte[] lockBytes = new byte[] { (byte)(lockVal >> 8), (byte)(lockVal & 0xFF) };
-                    hClient.WriteSingleRegister(1, 259, lockBytes); 
+                    hClient.WriteSingleRegister(1, 259, lockBytes);
                     hClient.Disconnect();
                 });
             }
@@ -552,28 +680,14 @@ namespace VictronEasyManager
                 if (isV2)
                 {
                     var openWbV2 = new OpenWbManagerV2(ip);
-                    if (allowCharge)
-                    {
-                        await openWbV2.SetzeAmpere(ampere);
-                        await openWbV2.StarteLaden();
-                    }
-                    else
-                    {
-                        await openWbV2.StoppeLaden();
-                    }
+                    if (allowCharge) { await openWbV2.SetzeAmpere(ampere); await openWbV2.StarteLaden(); }
+                    else await openWbV2.StoppeLaden();
                 }
                 else
                 {
                     var openWb = new OpenWbManager(ip);
-                    if (allowCharge)
-                    {
-                        await openWb.SetzeAmpere(ampere);
-                        await openWb.StarteLaden();
-                    }
-                    else
-                    {
-                        await openWb.StoppeLaden();
-                    }
+                    if (allowCharge) { await openWb.SetzeAmpere(ampere); await openWb.StarteLaden(); }
+                    else await openWb.StoppeLaden();
                 }
             }
             catch (Exception ex)
@@ -582,90 +696,27 @@ namespace VictronEasyManager
             }
         }
 
-        private async Task SendSwitchCommandAsync(ShellyDevice device, bool turnOn)
+        // =====================================================================
+        // VICTRON AUSLESEN (ohne try/catch: Fehler müssen nach oben durchschlagen)
+        // =====================================================================
+        private VictronData ReadVictronData(ModbusTcpClient client)
         {
-            if (device.DeviceModel == "custom")
-            {
-                string url = turnOn ? device.CustomOnUrl : device.CustomOffUrl;
-                if (!string.IsNullOrWhiteSpace(url))
-                {
-                    try { await _httpClient.GetAsync(url); } catch { }
-                }
-                return;
-            }
-            await SendRelayCommandAsync(device.IpAddress, turnOn);
+            ushort[] ac = client.ReadHoldingRegisters<ushort>(100, 817, 6).ToArray();   // 817-819 AC-Last, 820-822 Netz
+            ushort[] bat = client.ReadHoldingRegisters<ushort>(100, 840, 4).ToArray();  // 840 Spannung, 842 Leistung, 843 SOC
+            ushort pvRaw = client.ReadHoldingRegisters<ushort>(100, 850, 1).ToArray()[0];
+
+            double ac1 = SwapBytes(ac[0]), ac2 = SwapBytes(ac[1]), ac3 = SwapBytes(ac[2]);
+            double g1 = (short)SwapBytes(ac[3]), g2 = (short)SwapBytes(ac[4]), g3 = (short)SwapBytes(ac[5]);
+
+            double voltage = SwapBytes(bat[0]) / 10.0;
+            double battPower = (short)SwapBytes(bat[2]);   // + laden / - entladen
+            double soc = SwapBytes(bat[3]);
+
+            return new VictronData(soc, voltage, g1 + g2 + g3, SwapBytes(pvRaw), ac1 + ac2 + ac3,
+                                   g1, g2, g3, ac1, ac2, ac3, battPower);
         }
 
-        private async Task<bool?> FrageGeraeteStatusAbAsync(ShellyDevice device)
-        {
-            if (device.DeviceModel == "custom") return null;
-
-            string ip = device.IpAddress;
-            if (string.IsNullOrWhiteSpace(ip) || ip == "0.0.0.0") return null;
-
-            try {
-                var response = await _httpClient.GetAsync($"http://{ip}/cm?cmnd=Power");
-                if (response.IsSuccessStatusCode) {
-                    string content = await response.Content.ReadAsStringAsync();
-                    if (content.Contains("\"POWER\":\"ON\"")) return true;
-                    if (content.Contains("\"POWER\":\"OFF\"")) return false;
-                }
-            } catch { }
-
-            try {
-                var response = await _httpClient.GetAsync($"http://{ip}/relay/0");
-                if (response.IsSuccessStatusCode) {
-                    string content = await response.Content.ReadAsStringAsync();
-                    if (content.Contains("\"ison\":true")) return true;
-                    if (content.Contains("\"ison\":false")) return false;
-                }
-            } catch { }
-
-            try {
-                var response = await _httpClient.GetAsync($"http://{ip}/rpc/Switch.GetStatus?id=0");
-                if (response.IsSuccessStatusCode) {
-                    string content = await response.Content.ReadAsStringAsync();
-                    if (content.Contains("\"output\":true")) return true;
-                    if (content.Contains("\"output\":false")) return false;
-                }
-            } catch { }
-
-            return null;
-        }
-
-        private (double Soc, double Voltage, double GridPower, double Pv, double AcLoad, double G1, double G2, double G3, double Ac1, double Ac2, double Ac3) ReadVictronData(ModbusTcpClient client)
-        {
-            double soc = 0; double voltage = 0; double gridPower = 0; double pv = 0; double acLoad = 0;
-            short g1 = 0, g2 = 0, g3 = 0;
-            ushort ac1 = 0, ac2 = 0, ac3 = 0;
-
-            try { soc = SwapBytes(client.ReadHoldingRegisters<ushort>(100, 843, 1).ToArray()[0]); } catch { }
-            try { voltage = SwapBytes(client.ReadHoldingRegisters<ushort>(100, 840, 1).ToArray()[0]) / 10.0; } catch { }
-            
-            try 
-            {
-                g1 = (short)SwapBytes(client.ReadHoldingRegisters<ushort>(100, 820, 1).ToArray()[0]);
-                g2 = (short)SwapBytes(client.ReadHoldingRegisters<ushort>(100, 821, 1).ToArray()[0]);
-                g3 = (short)SwapBytes(client.ReadHoldingRegisters<ushort>(100, 822, 1).ToArray()[0]);
-                gridPower = g1 + g2 + g3;
-            } 
-            catch { }
-
-            try { pv = SwapBytes(client.ReadHoldingRegisters<ushort>(100, 850, 1).ToArray()[0]); } catch { }
-            
-            try 
-            {
-                ac1 = SwapBytes(client.ReadHoldingRegisters<ushort>(100, 817, 1).ToArray()[0]);
-                ac2 = SwapBytes(client.ReadHoldingRegisters<ushort>(100, 818, 1).ToArray()[0]);
-                ac3 = SwapBytes(client.ReadHoldingRegisters<ushort>(100, 819, 1).ToArray()[0]);
-                acLoad = ac1 + ac2 + ac3;
-            } 
-            catch { }
-            
-            return (soc, voltage, gridPower, pv, acLoad, g1, g2, g3, ac1, ac2, ac3);
-        }
-
-        private ushort SwapBytes(ushort val)
+        private static ushort SwapBytes(ushort val)
         {
             return (ushort)((val << 8) | (val >> 8));
         }
